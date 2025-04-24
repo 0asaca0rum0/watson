@@ -332,6 +332,7 @@ def train_model():
     # early stopping setup
     best_score = -np.inf
     no_improve = 0
+    best_val_acc = 0.0      # track best validation accuracy
 
     # --- use the stratified train_loader/val_loader defined above ---
     optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['base_lr'], weight_decay=0.05)
