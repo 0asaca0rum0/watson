@@ -503,14 +503,22 @@ def train_model():
             break
 
     writer.close()
-    # save final model weights
-    torch.save(
-        model.state_dict(),
-        os.path.join(writer.log_dir, 'final_model.pth')
-    )
 
     # rollback to best checkpoint
     model.load_state_dict(torch.load(os.path.join(OUTPUT_DIR, 'model_checkpoints', 'best_model.pth')))
+
+    # ------------------------
+    # Rebuild test loader at full resolution
+    # ------------------------
+    full_size = ORIGINAL_MAX_SIDE
+    full_aug = transforms.Compose([
+        transforms.Lambda(lambda img: resize_with_padding(img, full_size)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+    ])
+    test_transform_list = [full_aug]*CONFIG['num_experts']
+    test_ds = Subset(HAM10000Dataset(INPUT_DIR, test_transform_list), test_idx)
+    test_loader = make_loader(test_ds)
 
     # Plot metrics
     import matplotlib.pyplot as plt
