@@ -94,28 +94,30 @@ print(f"Using device: {device}")
 # Unified Configuration
 # =====================
 CONFIG = {
-    "batch_size": 128,              # increased for faster processing given 15GB VRAM
-    "image_size": 160,             # kept same for speed/quality trade-off
+    "batch_size": 128,
+    "image_size": 160,
     "base_lr": 2e-3,
     "warmup_epochs": 2,
     "max_epochs": 30,
     "accum_steps": 2,
-    "mixed_precision": True,       # Ensure mixed precision is enabled
+    "mixed_precision": True,
     "grad_clip": 1.0,
-    "num_workers": 6,              # increased worker count leveraging 12GB RAM
-    "cache_images": False,         # Disable caching for large datasets
+    "num_workers": 6,
+    "cache_images": False,
     "train_task": "both",
     "val_ratio": 0.1,
     "test_ratio": 0.1,
-    "patience": 6,       # early stopping patience
+    "patience": 6,
     "seed": SEED,
-    "compile_model": True,         # Enable torch.compile if available (PyTorch 2.0+)
-    "focal_gamma": 2.0,          # Focal Loss parameter
-    "label_smoothing": 0.1,      # Label smoothing factor
-    "ortho_weight": 0.01,        # Weight for expert orthogonality constraint
-    "stochastic_depth": 0.2,     # Probability for stochastic depth
-    "aug_level": "strong_v2"     # New augmentation preset
+    "compile_model": True,
+    "focal_gamma": 2.0,
+    "label_smoothing": 0.1,
+    "ortho_weight": 0.01,
+    "stochastic_depth": 0.2,
+    "aug_level": "strong_v2"
 }
+# add number of experts for MoE
+CONFIG['num_experts'] = 3
 
 # TPU/GPU detection
 # only attempt XLA import when TPU env vars are set
