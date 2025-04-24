@@ -23,12 +23,9 @@ import torch.cuda.amp as amp  # Use proper amp import
 from torch.nn.modules.dropout import Dropout
 from torch import nn
 
-# -- Kaggle‐specific setup ---------------------------------------------------
-os.environ['TQDM_DISABLE_JUPYTER'] = 'true'
-warnings.filterwarnings('ignore', category=UserWarning, module='tqdm.auto')
-
-INPUT_DIR = "/kaggle/input/ham1000-segmentation-and-classification"
-OUTPUT_DIR = "/kaggle/working"
+# Configure data dirs
+INPUT_DIR = "./ham1000-classification-segmentation"
+OUTPUT_DIR = "./working"
 os.makedirs(os.path.join(OUTPUT_DIR, "model_checkpoints"), exist_ok=True)
 os.makedirs(os.path.join(OUTPUT_DIR, "splits"), exist_ok=True)
 
@@ -150,49 +147,61 @@ def collate_moe(batch):
 
 
 # =====================
-# Transforms
+# Augmentation Pipeline
 # =====================
-# only two experts now
-transform_list = [
-    transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ]),
-    transforms.Compose([
-        transforms.ColorJitter(contrast=0.5),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
-]
+from torchvision.transforms import functional as F
 
-# Dynamically set num_experts to number of transforms
-CONFIG['num_experts'] = len(transform_list)
+# Resize with aspect ratio preserved and padding
+def resize_with_padding(image, size):
+    w, h = image.size
+    scale = size / max(w, h)
+    new_w, new_h = int(w * scale), int(h * scale)
+    image = image.resize((new_w, new_h), Image.BICUBIC)
+    pad_w, pad_h = size - new_w, size - new_h
+    padding = (pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2)
+    return F.pad(image, padding, fill=0)
 
-# Stronger, consistent augmentations
-strong_aug = transforms.Compose([
-    transforms.RandAugment(num_ops=2, magnitude=15),  # NEW
-    transforms.RandomResizedCrop(CONFIG['image_size'], scale=(0.8, 1.0)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(15),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+# Augmentation for training set
+train_augmentations = transforms.Compose([
+    transforms.Lambda(lambda img: resize_with_padding(img, CONFIG['image_size'])),  # Resize with padding
+    transforms.RandomRotation(30),  # Random rotation ±30°
+    transforms.RandomHorizontalFlip(),  # Horizontal flip
+    transforms.RandomVerticalFlip(),  # Vertical flip
+    transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),  # Random affine
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),  # Color jitter
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    transforms.GaussianBlur(kernel_size=3),           # NEW
-    transforms.RandomErasing(p=0.5)                     # NEW
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])  # Normalize
 ])
-# multi-view: resample per expert
-train_transform_list = [strong_aug for _ in range(CONFIG['num_experts'])]
-val_transform_list = [strong_aug for _ in range(CONFIG['num_experts'])]
+
+# Transforms for validation/test sets (resize + normalize only)
+val_test_augmentations = transforms.Compose([
+    transforms.Lambda(lambda img: resize_with_padding(img, CONFIG['image_size'])),  # Resize with padding
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])  # Normalize
+])
 
 # =====================
-# Dataset with Caching
+# Hybrid Sampling Strategy
 # =====================
+from torch.utils.data import WeightedRandomSampler
 
+def create_balanced_sampler(dataset):
+    # Compute class distribution
+    class_counts = np.bincount(dataset.labels)
+    total_samples = len(dataset)
+    class_weights = [total_samples / (len(class_counts) * count) for count in class_counts]
+    sample_weights = [class_weights[label] for label in dataset.labels]
+    return WeightedRandomSampler(sample_weights, num_samples=total_samples, replacement=True)
 
+# =====================
+# Dataset Modifications
+# =====================
 class HAM10000Dataset(Dataset):
-    def __init__(self, root_dir, transforms_list):
+    def __init__(self, root_dir, transforms_list, augment=False):
         self.root_dir = root_dir
         self.transforms_list = transforms_list
+        self.augment = augment
+        # ...existing code...
         self.resize = transforms.Resize(
             (CONFIG['image_size'], CONFIG['image_size']))  # moved here
         csv_path = os.path.join(root_dir, "GroundTruth.csv")
@@ -220,19 +229,15 @@ class HAM10000Dataset(Dataset):
         return self.resize(img), self.resize(mask)
 
     def __getitem__(self, idx):
-        if self.cache and idx in self.cache:
-            img, mask = self.cache[idx]
-        else:
-            img, mask = self._load_item(idx)
-            if self.cache is not None:
-                self.cache[idx] = (img, mask)  # Cache only when accessed
-
-        # Generate views on-demand
+        img, mask = self._load_item(idx)
         if self.transforms_list:
-            views = [tf(img.copy()) for tf in self.transforms_list]
+            if self.augment:
+                img = train_augmentations(img)  # Apply training augmentations
+            else:
+                img = val_test_augmentations(img)  # Apply validation/test transforms
             mask_tensor = transforms.functional.pil_to_tensor(mask)
             mask_tensor = (mask_tensor > 0).long().squeeze(0)
-            return views, mask_tensor, self.labels[idx]
+            return img, mask_tensor, self.labels[idx]
         else:
             return img, mask, self.labels[idx]
 
@@ -321,16 +326,16 @@ class MoE(nn.Module):
 # helper to build DataLoader with optimal settings
 
 
-def make_loader(dataset, shuffle=False):
+def make_loader(dataset, shuffle=False, sampler=None):
     return DataLoader(
         dataset,
         batch_size=CONFIG['batch_size'],
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=CONFIG['num_workers'],
         pin_memory=(device.type == 'cuda'),
         persistent_workers=True,
-        prefetch_factor=2,
-        collate_fn=collate_moe
+        prefetch_factor=2
     )
 
 
@@ -343,43 +348,32 @@ def train_model():
         logging.error(f"Failed to initialize dataset: {e}")
         return
 
-    # load once without augment
+    # Build datasets with augmentations
     full_ds = HAM10000Dataset(INPUT_DIR, None)
     labels = np.array(full_ds.labels)
     idxs = np.arange(len(full_ds))
 
-    # stratified test/train+val split
-    sss = StratifiedShuffleSplit(
-        1, test_size=CONFIG['test_ratio'], random_state=SEED)
+    # Stratified splits
+    sss = StratifiedShuffleSplit(1, test_size=CONFIG['test_ratio'], random_state=SEED)
     trval_idx, test_idx = next(sss.split(idxs, labels))
-    # stratified train/val split
-    sss = StratifiedShuffleSplit(
-        1, test_size=CONFIG['val_ratio']/(1-CONFIG['test_ratio']), random_state=SEED)
+    sss = StratifiedShuffleSplit(1, test_size=CONFIG['val_ratio']/(1-CONFIG['test_ratio']), random_state=SEED)
     train_idx, val_idx = next(sss.split(trval_idx, labels[trval_idx]))
 
-    # save indices
+    # Save indices
     np.save(os.path.join(OUTPUT_DIR, 'splits/train_idx.npy'), train_idx)
     np.save(os.path.join(OUTPUT_DIR, 'splits/val_idx.npy'), val_idx)
     np.save(os.path.join(OUTPUT_DIR, 'splits/test_idx.npy'), test_idx)
 
-    # build subsets with aug/val transforms
-    train_ds = torch.utils.data.Subset(HAM10000Dataset(
-        INPUT_DIR, train_transform_list), train_idx)
-    val_ds = torch.utils.data.Subset(HAM10000Dataset(
-        INPUT_DIR, val_transform_list),   val_idx)
-    test_ds = torch.utils.data.Subset(HAM10000Dataset(
-        INPUT_DIR, val_transform_list),   test_idx)
+    # Build subsets with augmentations
+    train_ds = torch.utils.data.Subset(HAM10000Dataset(INPUT_DIR, None, augment=True), train_idx)
+    val_ds = torch.utils.data.Subset(HAM10000Dataset(INPUT_DIR, None, augment=False), val_idx)
+    test_ds = torch.utils.data.Subset(HAM10000Dataset(INPUT_DIR, None, augment=False), test_idx)
 
-    # compute class weights for balanced CE loss
-    num_classes = len(np.unique(labels))
-    train_labels = labels[train_idx]
-    counts = np.bincount(train_labels, minlength=num_classes)
-    weights = 1.0 / (counts + 1e-6)
-    class_weights = torch.tensor(weights, dtype=torch.float).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    # Create sampler for balanced sampling
+    sampler = create_balanced_sampler(train_ds)
 
-    # build loaders
-    train_loader = make_loader(train_ds, shuffle=True)
+    # Build loaders
+    train_loader = make_loader(train_ds, sampler=sampler)
     val_loader = make_loader(val_ds)
     test_loader = make_loader(test_ds)
 
