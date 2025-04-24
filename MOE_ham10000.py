@@ -18,7 +18,7 @@ import warnings
 import random
 # new for stratified splits
 from sklearn.model_selection import StratifiedShuffleSplit
-import torch.cuda.amp as amp  # Use proper amp import
+import torch.cuda.amp as amp
 # NEW: Import for Gumbel softmax and DropPath
 from torch.nn.modules.dropout import Dropout
 from torch import nn
@@ -36,29 +36,11 @@ try:
 except ImportError:
     os.system("pip install -q torchmetrics timm")
 
-# helper for optional TPU/XLA import & logging
-
-
-def import_xla():
-    try:
-        import torch_xla.core.xla_model as xm
-        import torch_xla.distributed.parallel_loader as pl
-        logging.getLogger('torch_xla').setLevel(logging.ERROR)
-        return xm, pl
-    except ImportError:
-        return None, None
-
-
-xm, pl = import_xla()
-
-# choose device (TPU if available else GPU/CPU)
-
-
+# =====================
+# Device setup (GPU/CPU only)
+# =====================
 def get_device():
-    if xm and (os.getenv('COLAB_TPU_ADDR') or os.getenv('TPU_NAME')):
-        return xm.xla_device()
     return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
 
 # silence torch_xla TPU port errors globally
 logging.getLogger('torch_xla').setLevel(logging.ERROR)
@@ -114,39 +96,11 @@ CONFIG = {
     "label_smoothing": 0.1,
     "ortho_weight": 0.01,
     "stochastic_depth": 0.2,
-    "aug_level": "strong_v2"
+    "aug_level": "strong_v2",
+    'num_experts': 4
 }
-# add number of experts for MoE
-CONFIG['num_experts'] = 3
-
-# TPU/GPU detection
-# only attempt XLA import when TPU env vars are set
-TPU_AVAILABLE = False
-if os.environ.get('COLAB_TPU_ADDR') or os.environ.get('TPU_NAME'):
-    logging.getLogger("torch_xla").setLevel(logging.ERROR)
-    try:
-        import torch_xla.core.xla_model as xm
-        import torch_xla.distributed.parallel_loader as pl
-        _ = xm.xrt_world_size()       # verify TPU availability
-        TPU_AVAILABLE = True
-    except Exception:
-        TPU_AVAILABLE = False
-
-if TPU_AVAILABLE:
-    replicas = xm.xrt_world_size()   # number of TPU cores
-    CONFIG["batch_size"] = 16 * replicas  # adapt batch size
-    device = xm.xla_device()
-
-# custom collate to batch multi‑view inputs
-
-
-def collate_moe(batch):
-    views = list(zip(*[item[0] for item in batch]))
-    views = [torch.stack(vs, dim=0) for vs in views]
-    masks = torch.stack([item[1] for item in batch], dim=0)
-    labels = torch.tensor([item[2] for item in batch], dtype=torch.long)
-    return views, masks, labels
-
+# add number of experts
+CONFIG['num_experts'] = 4
 
 # =====================
 # Augmentation Pipeline
@@ -182,34 +136,35 @@ val_test_augmentations = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])  # Normalize
 ])
 
+# build per-expert transform lists
+train_transform_list = [train_augmentations for _ in range(CONFIG['num_experts'])]
+val_transform_list   = [val_test_augmentations for _ in range(CONFIG['num_experts'])]
+
 # =====================
 # Hybrid Sampling Strategy
 # =====================
 from torch.utils.data import WeightedRandomSampler, Subset
 
 def create_balanced_sampler(dataset):
-    # support both Dataset and Subset wrappers
+    # support Dataset or Subset
     if isinstance(dataset, Subset):
-        base = dataset.dataset
-        idxs = dataset.indices
+        base, idxs = dataset.dataset, dataset.indices
         labels = np.array(base.labels)[idxs]
     else:
         labels = np.array(dataset.labels)
-    # compute class weights inversely proportional to frequency
-    class_counts = np.bincount(labels)
+    counts = np.bincount(labels)
     total = len(labels)
-    weights_per_class = [ total/(len(class_counts)*c) for c in class_counts ]
-    sample_weights = [ weights_per_class[int(l)] for l in labels ]
-    return WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+    weights = [ total/(len(counts)*c) for c in counts ]
+    sample_w = [ weights[int(l)] for l in labels ]
+    return WeightedRandomSampler(sample_w, num_samples=total, replacement=True)
 
 # =====================
-# Dataset Modifications
+# Dataset (multi‐view)
 # =====================
 class HAM10000Dataset(Dataset):
-    def __init__(self, root_dir, transforms_list, augment=False):
+    def __init__(self, root_dir, transforms_list):
         self.root_dir = root_dir
         self.transforms_list = transforms_list
-        self.augment = augment
         # ...existing code...
         self.resize = transforms.Resize(
             (CONFIG['image_size'], CONFIG['image_size']))  # moved here
@@ -239,102 +194,18 @@ class HAM10000Dataset(Dataset):
 
     def __getitem__(self, idx):
         img, mask = self._load_item(idx)
+        # generate multi‐view inputs
         if self.transforms_list:
-            if self.augment:
-                img = train_augmentations(img)  # Apply training augmentations
-            else:
-                img = val_test_augmentations(img)  # Apply validation/test transforms
-            mask_tensor = transforms.functional.pil_to_tensor(mask)
-            mask_tensor = (mask_tensor > 0).long().squeeze(0)
-            return img, mask_tensor, self.labels[idx]
+            views = [tf(img.copy()) for tf in self.transforms_list]
         else:
-            return img, mask, self.labels[idx]
+            views = [transforms.ToTensor()(img)]
+        mask_t = transforms.functional.pil_to_tensor(mask)
+        mask_t = (mask_t > 0).long().squeeze(0)
+        return views, mask_t, self.labels[idx]
 
 # =====================
-# MoE Model with Checkpointing
+# DataLoader helper
 # =====================
-
-
-class ExpertModel(nn.Module):
-    def __init__(self, num_classes):
-        super().__init__()
-        # use smaller backbone
-        self.encoder = timm.create_model(
-            'efficientnet_b0', pretrained=True, features_only=True)
-        if hasattr(self.encoder, 'set_gradient_checkpointing'):
-            self.encoder.set_gradient_checkpointing(True)
-        ch = self.encoder.feature_info[-1]['num_chs']
-        self.avgpool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(ch, num_classes)
-        self.seg_head = nn.Sequential(
-            nn.Conv2d(ch, 128, 1),
-            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False),
-            nn.Conv2d(128, 64, 3, padding=1),
-            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False),
-            nn.Conv2d(64, 1, 1),  # binary segmentation
-            nn.Upsample(size=(
-                CONFIG['image_size'], CONFIG['image_size']), mode='bilinear', align_corners=False)
-        )
-        self.stoch_depth = CONFIG['stochastic_depth']
-
-    def forward(self, x):
-        # Use JIT tracing for encoder if not using gradient checkpointing
-        feats = self.encoder(x)[-1]
-        # Reduce memory usage by freeing intermediate activations
-        pooled = self.avgpool(feats).flatten(1)
-        cls_out = self.fc(pooled)
-        seg_out = self.seg_head(feats)
-        # Apply stochastic depth
-        cls_out = drop_path(cls_out, self.stoch_depth, self.training)
-        return cls_out, seg_out, pooled
-
-
-class MoE(nn.Module):
-    def __init__(self, num_classes):
-        super().__init__()
-        self.experts = nn.ModuleList(
-            [ExpertModel(num_classes) for _ in range(CONFIG['num_experts'])])
-        feat_dim = self.experts[0].fc.in_features * CONFIG['num_experts']
-        self.gate = nn.Sequential(
-            nn.Linear(feat_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.5),              # Increased dropout to 0.5
-            nn.Linear(256, CONFIG['num_experts'])
-            # No Softmax here; will use Gumbel-Softmax in forward
-        )
-
-    def forward(self, views):
-        # Ensure views length == num_experts
-        assert len(views) == CONFIG['num_experts'], \
-            f"Expected {CONFIG['num_experts']} views, but got {len(views)}"
-        outs = [e(v) for e, v in zip(self.experts, views)]
-        cls = torch.stack([o[0] for o in outs], dim=1)
-        seg = torch.stack([o[1] for o in outs], dim=1)
-        feats = torch.cat([o[2] for o in outs], dim=1)
-        gate_logits = self.gate(feats)
-        # Use Gumbel-Softmax with hard sampling for sparsity
-        weights = F.gumbel_softmax(gate_logits, tau=1, hard=True, dim=1)
-        cls_out = (cls * weights.unsqueeze(-1)).sum(1)
-        seg_out = (
-            seg * weights.view(-1, CONFIG['num_experts'], 1, 1, 1)).sum(1)
-        # NEW: Compute expert orthogonality loss and attach as an attribute
-        expert_weights = torch.stack(
-            [F.normalize(ex.fc.weight, dim=1) for ex in self.experts])
-        ortho_loss = 0
-        for i in range(expert_weights.size(0)):
-            for j in range(i+1, expert_weights.size(0)):
-                ortho_loss += torch.mean(
-                    (expert_weights[i] * expert_weights[j]).sum(dim=1))
-        self.ortho_loss = CONFIG['ortho_weight'] * ortho_loss
-        return cls_out, seg_out
-
-# =====================
-# Training & Visualization
-# =====================
-
-# helper to build DataLoader with optimal settings
-
-
 def make_loader(dataset, shuffle=False, sampler=None):
     return DataLoader(
         dataset,
@@ -342,31 +213,19 @@ def make_loader(dataset, shuffle=False, sampler=None):
         shuffle=shuffle if sampler is None else False,
         sampler=sampler,
         num_workers=CONFIG['num_workers'],
-        pin_memory=(device.type == 'cuda'),
-        persistent_workers=True,
-        prefetch_factor=2
+        pin_memory=(device.type=='cuda')
     )
 
-
 def train_model():
-    best_val_acc = 0.0
-    logging.info(f"Training on device: {device}")
-    try:
-        # full dataset without per-sample transforms for stratified splitting
-        ds = HAM10000Dataset(INPUT_DIR, None)
-    except Exception as e:
-        logging.error(f"Failed to initialize dataset: {e}")
-        return
-
-    # Build datasets with augmentations
-    full_ds = HAM10000Dataset(INPUT_DIR, None)
-    labels = np.array(full_ds.labels)
-    idxs = np.arange(len(full_ds))
-
-    # Stratified splits
-    sss = StratifiedShuffleSplit(1, test_size=CONFIG['test_ratio'], random_state=SEED)
+    device = get_device()
+    # full dataset for splits
+    ds = HAM10000Dataset(INPUT_DIR, None)
+    labels = np.array(ds.labels)
+    idxs = np.arange(len(ds))
+    # stratified split
+    sss = StratifiedShuffleSplit(1, test_size=CONFIG['test_ratio'], random_state=CONFIG['seed'])
     trval_idx, test_idx = next(sss.split(idxs, labels))
-    sss = StratifiedShuffleSplit(1, test_size=CONFIG['val_ratio']/(1-CONFIG['test_ratio']), random_state=SEED)
+    sss = StratifiedShuffleSplit(1, test_size=CONFIG['val_ratio']/(1-CONFIG['test_ratio']), random_state=CONFIG['seed'])
     train_idx, val_idx = next(sss.split(trval_idx, labels[trval_idx]))
 
     # Save indices
@@ -374,23 +233,16 @@ def train_model():
     np.save(os.path.join(OUTPUT_DIR, 'splits/val_idx.npy'), val_idx)
     np.save(os.path.join(OUTPUT_DIR, 'splits/test_idx.npy'), test_idx)
 
-    # Build subsets with augmentations
-    train_ds = torch.utils.data.Subset(HAM10000Dataset(INPUT_DIR, None, augment=True), train_idx)
-    val_ds = torch.utils.data.Subset(HAM10000Dataset(INPUT_DIR, None, augment=False), val_idx)
-    test_ds = torch.utils.data.Subset(HAM10000Dataset(INPUT_DIR, None, augment=False), test_idx)
+    # subsets with proper transforms
+    train_ds = Subset(HAM10000Dataset(INPUT_DIR, train_transform_list), train_idx)
+    val_ds   = Subset(HAM10000Dataset(INPUT_DIR, val_transform_list),   val_idx)
+    test_ds  = Subset(HAM10000Dataset(INPUT_DIR, val_transform_list),   test_idx)
 
-    # Create sampler for balanced sampling
-    sampler = create_balanced_sampler(train_ds)
-
-    # Build loaders
-    train_loader = make_loader(train_ds, sampler=sampler)
-    val_loader = make_loader(val_ds)
+    # balanced sampler + loaders
+    sampler     = create_balanced_sampler(train_ds)
+    train_loader= make_loader(train_ds, sampler=sampler)
+    val_loader  = make_loader(val_ds)
     test_loader = make_loader(test_ds)
-
-    if TPU_AVAILABLE:
-        train_loader = pl.MpDeviceLoader(train_loader, device)
-        val_loader = pl.MpDeviceLoader(val_loader,   device)
-        test_loader = pl.MpDeviceLoader(test_loader,  device)
 
     # instantiate model on GPU
     model = MoE(num_classes=7).to(device).to(memory_format=torch.channels_last)
