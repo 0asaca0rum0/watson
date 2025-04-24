@@ -281,11 +281,13 @@ def make_loader(dataset, shuffle=False, sampler=None):
         pin_memory=(device.type=='cuda')
     )
 
+# original max side length
+ORIGINAL_MAX_SIDE = 600
+
 def train_model():
-    # use global transform lists to allow in-place updates (e.g., progressive resizing)
     global train_transform_list, val_transform_list
     device = get_device()
-    # full dataset for splits
+    # prepare splits
     ds = HAM10000Dataset(INPUT_DIR, None)
     labels = np.array(ds.labels)
     idxs = np.arange(len(ds))
@@ -300,13 +302,15 @@ def train_model():
     np.save(os.path.join(OUTPUT_DIR, 'splits/val_idx.npy'), val_idx)
     np.save(os.path.join(OUTPUT_DIR, 'splits/test_idx.npy'), test_idx)
 
+    # define balanced sampler once
+    sampler = create_balanced_sampler(Subset(HAM10000Dataset(INPUT_DIR, None), train_idx))
+    
     # subsets with proper transforms
     train_ds = Subset(HAM10000Dataset(INPUT_DIR, train_transform_list), train_idx)
     val_ds   = Subset(HAM10000Dataset(INPUT_DIR, val_transform_list),   val_idx)
     test_ds  = Subset(HAM10000Dataset(INPUT_DIR, val_transform_list),   test_idx)
 
     # balanced sampler + loaders
-    sampler     = create_balanced_sampler(train_ds)
     train_loader= make_loader(train_ds, sampler=sampler)
     val_loader  = make_loader(val_ds)
     test_loader = make_loader(test_ds)
@@ -334,7 +338,6 @@ def train_model():
     no_improve = 0
     best_val_acc = 0.0      # track best validation accuracy
 
-    # --- use the stratified train_loader/val_loader defined above ---
     optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['base_lr'], weight_decay=0.05)
     scaler = amp.GradScaler(enabled=CONFIG['mixed_precision'])
     total_steps = CONFIG['max_epochs'] * (len(train_loader)//CONFIG['accum_steps'])
@@ -361,24 +364,34 @@ def train_model():
             print(f"Failed to compile model: {e}")
 
     for epoch in range(CONFIG['max_epochs']):
-        if epoch == 10:
-            print("Progressive resizing: updating image_size to 192")
-            CONFIG['image_size'] = 192
-            # Rebuild strong_aug for new resolution (other transforms remain the same)
-            strong_aug = transforms.Compose([
-                transforms.RandAugment(num_ops=2, magnitude=15),
-                transforms.RandomResizedCrop(CONFIG['image_size'], scale=(0.8, 1.0)),
-                transforms.RandomHorizontalFlip(),
-                transforms.RandomRotation(15),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-                transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-                transforms.GaussianBlur(kernel_size=3),
-                transforms.RandomErasing(p=0.5)
-            ])
-            train_transform_list = [strong_aug for _ in range(CONFIG['num_experts'])]
-            val_transform_list   = [strong_aug for _ in range(CONFIG['num_experts'])]
-            # Optionally, reinitialize datasets/loaders here
+        # continuous resizing schedule
+        size = int(160 + (ORIGINAL_MAX_SIDE - 160) * epoch / (CONFIG['max_epochs'] - 1))
+        CONFIG['image_size'] = size
+
+        # rebuild augmentations with new size
+        train_aug = transforms.Compose([
+            transforms.Lambda(lambda img: resize_with_padding(img, size)), 
+            transforms.RandomRotation(30), transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomAffine(0, (0.1,0.1), (0.9,1.1)),
+            transforms.ColorJitter(0.2,0.2,0.2),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+        ])
+        val_aug = transforms.Compose([
+            transforms.Lambda(lambda img: resize_with_padding(img, size)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+        ])
+        train_transform_list = [train_aug]*CONFIG['num_experts']
+        val_transform_list   = [val_aug]*CONFIG['num_experts']
+
+        # rebuild datasets/loaders for this epoch
+        train_ds = Subset(HAM10000Dataset(INPUT_DIR, train_transform_list), train_idx)
+        val_ds   = Subset(HAM10000Dataset(INPUT_DIR, val_transform_list),   val_idx)
+        train_loader = make_loader(train_ds, sampler=sampler)
+        val_loader   = make_loader(val_ds)
+
         model.train()
         running_loss = 0.0
         for i, (views, masks, labels) in enumerate(tqdm(train_loader)):
@@ -553,6 +566,23 @@ def train_model():
     print(f"Mean Test IoU: {np.mean(all_iou):.4f}")
     print("Test Confusion Matrix:")
     print(confusion_matrix(all_labels, all_preds))
+
+    # add detailed test-set metrics
+    from sklearn.metrics import (
+        accuracy_score, precision_score,
+        recall_score, f1_score, balanced_accuracy_score
+    )
+    test_acc   = accuracy_score(all_labels, all_preds)
+    test_prec  = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
+    test_rec   = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
+    test_f1    = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+    bal_acc    = balanced_accuracy_score(all_labels, all_preds)
+
+    print(f"Test Accuracy:           {test_acc:.4f}")
+    print(f"Weighted Precision:      {test_prec:.4f}")
+    print(f"Weighted Recall:         {test_rec:.4f}")
+    print(f"Weighted F1-score:       {test_f1:.4f}")
+    print(f"Balanced Accuracy:       {bal_acc:.4f}")
 
 
 # NEW: Implement Focal Loss with label smoothing
