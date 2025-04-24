@@ -217,6 +217,8 @@ def make_loader(dataset, shuffle=False, sampler=None):
     )
 
 def train_model():
+    # use global transform lists to allow in-place updates (e.g., progressive resizing)
+    global train_transform_list, val_transform_list
     device = get_device()
     # full dataset for splits
     ds = HAM10000Dataset(INPUT_DIR, None)
