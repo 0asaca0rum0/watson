@@ -343,7 +343,8 @@ def train_model():
     best_val_acc = 0.0
     logging.info(f"Training on device: {device}")
     try:
-        ds = HAM10000Dataset(INPUT_DIR, transform_list)
+        # full dataset without per-sample transforms for stratified splitting
+        ds = HAM10000Dataset(INPUT_DIR, None)
     except Exception as e:
         logging.error(f"Failed to initialize dataset: {e}")
         return
