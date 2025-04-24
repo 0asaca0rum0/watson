@@ -326,246 +326,229 @@ def train_model():
     best_score = -np.inf
     no_improve = 0
 
-    try:
-        train_len = int(0.8*len(ds))
-        train_ds, val_ds = random_split(ds, [train_len, len(ds)-train_len])
-        train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True,
-                                  num_workers=CONFIG['num_workers'], pin_memory=True,
-                                  collate_fn=collate_moe)
-        val_loader = DataLoader(val_ds, batch_size=CONFIG['batch_size'], shuffle=False,
-                                num_workers=CONFIG['num_workers'], pin_memory=True,
-                                collate_fn=collate_moe)
+    # --- use the stratified train_loader/val_loader defined above ---
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['base_lr'], weight_decay=0.05)
+    scaler = amp.GradScaler(enabled=CONFIG['mixed_precision'])
+    total_steps = CONFIG['max_epochs'] * (len(train_loader)//CONFIG['accum_steps'])
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=CONFIG['base_lr'], total_steps=total_steps,
+        pct_start=CONFIG['warmup_epochs']/CONFIG['max_epochs']
+    )
 
-        model = MoE(num_classes=7).to(device).to(
-            memory_format=torch.channels_last)
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=CONFIG['base_lr'], weight_decay=0.05)
-        scaler = amp.GradScaler(enabled=CONFIG['mixed_precision'])
-        total_steps = CONFIG['max_epochs'] * \
-            (len(train_loader)//CONFIG['accum_steps'])
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=CONFIG['base_lr'],
-            total_steps=total_steps,
-            pct_start=CONFIG['warmup_epochs']/CONFIG['max_epochs']
-        )
+    writer = SummaryWriter(log_dir=os.path.join(OUTPUT_DIR, 'logs'))
 
-        writer = SummaryWriter(log_dir=os.path.join(OUTPUT_DIR, 'logs'))
+    history = {'train_loss': [], 'val_acc': []}
 
-        history = {'train_loss': [], 'val_acc': []}
+    # set up richer metrics
+    auroc = torchmetrics.classification.MulticlassAUROC(
+        num_classes=7).to(device)
+    iou = torchmetrics.JaccardIndex(task="binary").to(device)
 
-        # set up richer metrics
-        auroc = torchmetrics.classification.MulticlassAUROC(
-            num_classes=7).to(device)
-        iou = torchmetrics.JaccardIndex(task="binary").to(device)
+    # Apply torch.compile if available (PyTorch 2.0+)
+    if CONFIG['compile_model'] and hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model)
+            print("Model successfully compiled with torch.compile")
+        except Exception as e:
+            print(f"Failed to compile model: {e}")
 
-        # Apply torch.compile if available (PyTorch 2.0+)
-        if CONFIG['compile_model'] and hasattr(torch, 'compile'):
+    for epoch in range(CONFIG['max_epochs']):
+        if epoch == 10:
+            print("Progressive resizing: updating image_size to 192")
+            CONFIG['image_size'] = 192
+            # Rebuild strong_aug for new resolution (other transforms remain the same)
+            strong_aug = transforms.Compose([
+                transforms.RandAugment(num_ops=2, magnitude=15),
+                transforms.RandomResizedCrop(CONFIG['image_size'], scale=(0.8, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(15),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                transforms.GaussianBlur(kernel_size=3),
+                transforms.RandomErasing(p=0.5)
+            ])
+            train_transform_list = [strong_aug for _ in range(CONFIG['num_experts'])]
+            val_transform_list   = [strong_aug for _ in range(CONFIG['num_experts'])]
+            # Optionally, reinitialize datasets/loaders here
+        model.train()
+        running_loss = 0.0
+        for i, (views, masks, labels) in enumerate(tqdm(train_loader)):
             try:
-                model = torch.compile(model)
-                print("Model successfully compiled with torch.compile")
-            except Exception as e:
-                print(f"Failed to compile model: {e}")
-
-        for epoch in range(CONFIG['max_epochs']):
-            if epoch == 10:
-                print("Progressive resizing: updating image_size to 192")
-                CONFIG['image_size'] = 192
-                # Rebuild strong_aug for new resolution (other transforms remain the same)
-                strong_aug = transforms.Compose([
-                    transforms.RandAugment(num_ops=2, magnitude=15),
-                    transforms.RandomResizedCrop(CONFIG['image_size'], scale=(0.8, 1.0)),
-                    transforms.RandomHorizontalFlip(),
-                    transforms.RandomRotation(15),
-                    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-                    transforms.ToTensor(),
-                    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-                    transforms.GaussianBlur(kernel_size=3),
-                    transforms.RandomErasing(p=0.5)
-                ])
-                train_transform_list = [strong_aug for _ in range(CONFIG['num_experts'])]
-                val_transform_list   = [strong_aug for _ in range(CONFIG['num_experts'])]
-                # Optionally, reinitialize datasets/loaders here
-            model.train()
-            running_loss = 0.0
-            for i, (views, masks, labels) in enumerate(tqdm(train_loader)):
-                try:
-                    views = [v.to(device, non_blocking=True).to(
-                        memory_format=torch.channels_last) for v in views]
-                    masks = masks.to(device, non_blocking=True)
-                    labels = labels.to(device, non_blocking=True)
-                    with amp.autocast(enabled=CONFIG['mixed_precision'] and not TPU_AVAILABLE):
-                        cls_logits, seg_logits = model(views)
-                        loss_cls = criterion(cls_logits, labels)
-                        if CONFIG['train_task'] == 'both':
-                            tgt = masks.unsqueeze(1).float()  # [B,1,H,W]
-                            loss_seg = F.binary_cross_entropy_with_logits(
-                                seg_logits, tgt)
-                        else:
-                            loss_seg = 0.0
-                        loss = (loss_cls + loss_seg) / CONFIG['accum_steps']
-                    # Scale the loss and backpropagate
-                    scaler.scale(loss).backward()
-                    if (i+1) % CONFIG['accum_steps'] == 0:
-                        if TPU_AVAILABLE:
-                            xm.optimizer_step(optimizer, barrier=True)
-                            xm.mark_step()
-                        else:
-                            scaler.step(optimizer)
-                            scaler.update()
-                            optimizer.zero_grad()
-                        # Log gradient histograms for sanity checks
-                        for name, param in model.named_parameters():
-                            if param.grad is not None:
-                                writer.add_histogram(f"grad/{name}", param.grad.cpu(), epoch)
-                    running_loss += loss.item()
-                    if i % 10 == 0 and device.type == 'cuda':
-                        torch.cuda.empty_cache()
-                except RuntimeError as e:
-                    if 'out of memory' in str(e).lower():
-                        print("OOM encountered; clearing cache.")
-                        if device.type == 'cuda':
-                            torch.cuda.empty_cache()
-                        continue
+                views = [v.to(device, non_blocking=True).to(
+                    memory_format=torch.channels_last) for v in views]
+                masks = masks.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                with amp.autocast(enabled=CONFIG['mixed_precision'] and not TPU_AVAILABLE):
+                    cls_logits, seg_logits = model(views)
+                    loss_cls = criterion(cls_logits, labels)
+                    if CONFIG['train_task'] == 'both':
+                        tgt = masks.unsqueeze(1).float()  # [B,1,H,W]
+                        loss_seg = F.binary_cross_entropy_with_logits(
+                            seg_logits, tgt)
                     else:
-                        raise
-            avg_loss = running_loss/len(train_loader)
-            history['train_loss'].append(avg_loss)
-            writer.add_scalar('Loss/train', avg_loss, epoch)
+                        loss_seg = 0.0
+                    loss = (loss_cls + loss_seg) / CONFIG['accum_steps']
+                # Scale the loss and backpropagate
+                scaler.scale(loss).backward()
+                if (i+1) % CONFIG['accum_steps'] == 0:
+                    if TPU_AVAILABLE:
+                        xm.optimizer_step(optimizer, barrier=True)
+                        xm.mark_step()
+                    else:
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
+                    # Log gradient histograms for sanity checks
+                    for name, param in model.named_parameters():
+                        if param.grad is not None:
+                            writer.add_histogram(f"grad/{name}", param.grad.cpu(), epoch)
+                running_loss += loss.item()
+                if i % 10 == 0 and device.type == 'cuda':
+                    torch.cuda.empty_cache()
+            except RuntimeError as e:
+                if 'out of memory' in str(e).lower():
+                    print("OOM encountered; clearing cache.")
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise
+        avg_loss = running_loss/len(train_loader)
+        history['train_loss'].append(avg_loss)
+        writer.add_scalar('Loss/train', avg_loss, epoch)
 
-            model.eval()
-            correct = 0
-            total = 0
-            auroc.reset()
-            iou.reset()
-            with torch.no_grad():
-                for views, masks, labels in val_loader:
-                    views = [v.to(device).to(memory_format=torch.channels_last)
-                             for v in views]
-                    labels = labels.to(device)
-                    masks = masks.to(device)
-                    with amp.autocast(enabled=CONFIG['mixed_precision']):
-                        logits, seg_logits = model(views)
-                    preds = logits.argmax(1)
-                    correct += (preds == labels).sum().item()
-                    total += labels.size(0)
-                    auroc.update(logits.softmax(dim=1), labels)
-                    iou.update(
-                        (seg_logits.sigmoid() > 0.5).long().squeeze(1), masks)
+        # validation phase using val_loader
+        model.eval()
+        correct = 0
+        total = 0
+        auroc.reset()
+        iou.reset()
+        with torch.no_grad():
+            for views, masks, labels in val_loader:
+                views = [v.to(device).to(memory_format=torch.channels_last)
+                         for v in views]
+                labels = labels.to(device)
+                masks = masks.to(device)
+                with amp.autocast(enabled=CONFIG['mixed_precision']):
+                    logits, seg_logits = model(views)
+                preds = logits.argmax(1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+                auroc.update(logits.softmax(dim=1), labels)
+                iou.update(
+                    (seg_logits.sigmoid() > 0.5).long().squeeze(1), masks)
 
-            val_acc = correct/total
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                torch.save(
-                    model.state_dict(),
-                    os.path.join(writer.log_dir, 'best_model.pth')
-                )
-            val_auroc = auroc.compute()
-            val_iou = iou.compute()
-            history['val_acc'].append(val_acc)
-            writer.add_scalar('Accuracy/val', val_acc, epoch)
-            writer.add_scalar('AUROC/val', val_auroc, epoch)
-            writer.add_scalar('IoU/val', val_iou, epoch)
-
-            # Log expert diversity score: mean pairwise cosine similarity of expert fc weights
-            expert_weights = torch.stack([F.normalize(ex.fc.weight, dim=1) for ex in model.experts])
-            diversity = 0
-            cnt = 0
-            for i in range(expert_weights.size(0)):
-                for j in range(i+1, expert_weights.size(0)):
-                    diversity += (expert_weights[i] * expert_weights[j]).sum(dim=1).mean()
-                    cnt += 1
-            diversity_score = diversity / cnt if cnt > 0 else 0
-            writer.add_scalar('ExpertDiversity', diversity_score, epoch)
-
-            print(
-                f"Epoch {epoch+1}/{CONFIG['max_epochs']} - "
-                f"loss: {avg_loss:.4f}, "
-                f"val_acc: {val_acc:.4f}, "
-                f"val_auroc: {val_auroc:.4f}, "
-                f"val_iou: {val_iou:.4f}"
+        val_acc = correct/total
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(
+                model.state_dict(),
+                os.path.join(writer.log_dir, 'best_model.pth')
             )
+        val_auroc = auroc.compute()
+        val_iou = iou.compute()
+        history['val_acc'].append(val_acc)
+        writer.add_scalar('Accuracy/val', val_acc, epoch)
+        writer.add_scalar('AUROC/val', val_auroc, epoch)
+        writer.add_scalar('IoU/val', val_iou, epoch)
 
-            score = val_auroc + val_iou   # combined monitoring metric
-            if score > best_score:
-                best_score = score
-                no_improve = 0
-                torch.save(model.state_dict(), os.path.join(
-                    OUTPUT_DIR, 'model_checkpoints/best_model.pth'))  # checkpoint
-            else:
-                no_improve += 1
-            if no_improve >= CONFIG['patience']:
-                print(f"Early stopping at epoch {epoch+1}")
-                break
+        # Log expert diversity score: mean pairwise cosine similarity of expert fc weights
+        expert_weights = torch.stack([F.normalize(ex.fc.weight, dim=1) for ex in model.experts])
+        diversity = 0
+        cnt = 0
+        for i in range(expert_weights.size(0)):
+            for j in range(i+1, expert_weights.size(0)):
+                diversity += (expert_weights[i] * expert_weights[j]).sum(dim=1).mean()
+                cnt += 1
+        diversity_score = diversity / cnt if cnt > 0 else 0
+        writer.add_scalar('ExpertDiversity', diversity_score, epoch)
 
-        writer.close()
-        # save final model weights
-        torch.save(
-            model.state_dict(),
-            os.path.join(writer.log_dir, 'final_model.pth')
+        print(
+            f"Epoch {epoch+1}/{CONFIG['max_epochs']} - "
+            f"loss: {avg_loss:.4f}, "
+            f"val_acc: {val_acc:.4f}, "
+            f"val_auroc: {val_auroc:.4f}, "
+            f"val_iou: {val_iou:.4f}"
         )
 
-        # rollback to best checkpoint
-        model.load_state_dict(torch.load(os.path.join(OUTPUT_DIR, 'model_checkpoints', 'best_model.pth')))
+        score = val_auroc + val_iou   # combined monitoring metric
+        if score > best_score:
+            best_score = score
+            no_improve = 0
+            torch.save(model.state_dict(), os.path.join(
+                OUTPUT_DIR, 'model_checkpoints/best_model.pth'))  # checkpoint
+        else:
+            no_improve += 1
+        if no_improve >= CONFIG['patience']:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
 
-        # Plot metrics
-        import matplotlib.pyplot as plt
-        plt.figure()
-        plt.plot(history['train_loss'], label='Train Loss')
-        plt.plot(history['val_acc'], label='Val Acc')
-        plt.xlabel('Epoch')
-        plt.legend()
-        plt.title('Training Loss and Validation Accuracy')
-        plt.show()
+    writer.close()
+    # save final model weights
+    torch.save(
+        model.state_dict(),
+        os.path.join(writer.log_dir, 'final_model.pth')
+    )
 
-        # Confusion matrix
-        from sklearn.metrics import confusion_matrix
-        all_preds, all_labels = [], []
-        model.eval()
-        with torch.no_grad():
-            for views, _, labels in val_loader:
-                views = [v.to(device).to(memory_format=torch.channels_last)
-                         for v in views]
-                logits, _ = model(views)
-                all_preds.extend(logits.argmax(1).cpu().numpy())
-                all_labels.extend(labels.numpy())
-        cm = confusion_matrix(all_labels, all_preds)
-        plt.figure()
-        plt.matshow(cm)
-        plt.title('Confusion Matrix')
-        plt.colorbar()
-        plt.show()
+    # rollback to best checkpoint
+    model.load_state_dict(torch.load(os.path.join(OUTPUT_DIR, 'model_checkpoints', 'best_model.pth')))
 
-        # ---------
-        # Held-out test evaluation
-        # ---------
-        model.eval()
-        all_preds, all_labels = [], []
-        all_iou = []
-        with torch.no_grad():
-            for views, masks, labels in test_loader:
-                views = [v.to(device).to(memory_format=torch.channels_last)
-                         for v in views]
-                logits, seg_logits = model(views)
-                preds = logits.argmax(1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.numpy())
-                # per-image IoU
-                pred_masks = (seg_logits.sigmoid() > 0.5).long().squeeze(1)
-                for pm, gm in zip(pred_masks.cpu(), masks):
-                    all_iou.append(torchmetrics.functional.jaccard_index(
-                        pm, gm, task="binary").item())
+    # Plot metrics
+    import matplotlib.pyplot as plt
+    plt.figure()
+    plt.plot(history['train_loss'], label='Train Loss')
+    plt.plot(history['val_acc'], label='Val Acc')
+    plt.xlabel('Epoch')
+    plt.legend()
+    plt.title('Training Loss and Validation Accuracy')
+    plt.show()
 
-        # per-class metrics
-        from sklearn.metrics import classification_report
-        print("Test Classification Report:")
-        print(classification_report(all_labels, all_preds, digits=4))
-        print(f"Mean Test IoU: {np.mean(all_iou):.4f}")
-        print("Test Confusion Matrix:")
-        print(confusion_matrix(all_labels, all_preds))
+    # Confusion matrix
+    from sklearn.metrics import confusion_matrix
+    all_preds, all_labels = [], []
+    model.eval()
+    with torch.no_grad():
+        for views, _, labels in val_loader:
+            views = [v.to(device).to(memory_format=torch.channels_last)
+                     for v in views]
+            logits, _ = model(views)
+            all_preds.extend(logits.argmax(1).cpu().numpy())
+            all_labels.extend(labels.numpy())
+    cm = confusion_matrix(all_labels, all_preds)
+    plt.figure()
+    plt.matshow(cm)
+    plt.title('Confusion Matrix')
+    plt.colorbar()
+    plt.show()
 
-    except Exception as e:
-        logging.error(f"Training aborted due to error: {e}")
-        return
+    # ---------
+    # Held-out test evaluation
+    # ---------
+    model.eval()
+    all_preds, all_labels = [], []
+    all_iou = []
+    with torch.no_grad():
+        for views, masks, labels in test_loader:
+            views = [v.to(device).to(memory_format=torch.channels_last)
+                     for v in views]
+            logits, seg_logits = model(views)
+            preds = logits.argmax(1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.numpy())
+            # per-image IoU
+            pred_masks = (seg_logits.sigmoid() > 0.5).long().squeeze(1)
+            for pm, gm in zip(pred_masks.cpu(), masks):
+                all_iou.append(torchmetrics.functional.jaccard_index(
+                    pm, gm, task="binary").item())
+
+    # per-class metrics
+    from sklearn.metrics import classification_report
+    print("Test Classification Report:")
+    print(classification_report(all_labels, all_preds, digits=4))
+    print(f"Mean Test IoU: {np.mean(all_iou):.4f}")
+    print("Test Confusion Matrix:")
+    print(confusion_matrix(all_labels, all_preds))
 
 
 # NEW: Implement Focal Loss with label smoothing
