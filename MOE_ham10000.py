@@ -217,14 +217,13 @@ class ExpertModel(nn.Module):
         ch = self.encoder.feature_info[-1]['num_chs']
         self.avgpool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Linear(ch, num_classes)
+        # remove final fixed upsample
         self.seg_head = nn.Sequential(
             nn.Conv2d(ch, 128, 1),
             nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False),
             nn.Conv2d(128, 64, 3, padding=1),
             nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False),
-            nn.Conv2d(64, 1, 1),  # binary segmentation
-            nn.Upsample(size=(CONFIG['image_size'], CONFIG['image_size']),
-                        mode='bilinear', align_corners=False)
+            nn.Conv2d(64, 1, 1)  # binary segmentation
         )
         self.stoch_depth = CONFIG['stochastic_depth']
 
@@ -232,7 +231,9 @@ class ExpertModel(nn.Module):
         feats = self.encoder(x)[-1]
         pooled = self.avgpool(feats).flatten(1)
         cls_out = self.fc(pooled)
+        # dynamic final resize to input resolution
         seg_out = self.seg_head(feats)
+        seg_out = F.interpolate(seg_out, size=x.shape[-2:], mode='bilinear', align_corners=False)
         cls_out = drop_path(cls_out, self.stoch_depth, self.training)
         return cls_out, seg_out, pooled
 
