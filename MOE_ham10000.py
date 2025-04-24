@@ -314,6 +314,13 @@ def train_model():
     # instantiate model on GPU (use correct class name MoE)
     model = MoE(num_classes=7).to(device).to(memory_format=torch.channels_last)
 
+    # Define criterion (loss function)
+    criterion = FocalLoss(
+        gamma=CONFIG['focal_gamma'],
+        smoothing=CONFIG['label_smoothing'],
+        reduction="mean"
+    )
+
     # safe checkpoint load
     ckpt_path = os.path.join(OUTPUT_DIR, 'model_checkpoints', 'best_model.pth')
     if os.path.isfile(ckpt_path):
