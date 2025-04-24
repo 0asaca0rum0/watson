@@ -105,7 +105,7 @@ CONFIG['num_experts'] = 4
 # =====================
 # Augmentation Pipeline
 # =====================
-from torchvision.transforms import functional as F
+import torchvision.transforms.functional as TF
 
 # Resize with aspect ratio preserved and padding
 def resize_with_padding(image, size):
@@ -115,7 +115,7 @@ def resize_with_padding(image, size):
     image = image.resize((new_w, new_h), Image.BICUBIC)
     pad_w, pad_h = size - new_w, size - new_h
     padding = (pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2)
-    return F.pad(image, padding, fill=0)
+    return TF.pad(image, padding, fill=0)
 
 # Augmentation for training set
 train_augmentations = transforms.Compose([
@@ -258,7 +258,7 @@ class MoE(nn.Module):
         seg_stack = torch.stack([o[1] for o in outs], dim=1)
         feats = torch.cat([o[2] for o in outs], dim=1)
         gate_logits = self.gate(feats)
-        weights = F.gumbel_softmax(gate_logits, tau=1, hard=True, dim=1)
+        weights = torch.nn.functional.gumbel_softmax(gate_logits, tau=1, hard=True, dim=1)
         cls_out = (cls_stack * weights.unsqueeze(-1)).sum(1)
         seg_out = (seg_stack * weights.view(-1, CONFIG['num_experts'], 1, 1, 1)).sum(1)
         # expert orthogonality loss
@@ -379,7 +379,7 @@ def train_model():
                     memory_format=torch.channels_last) for v in views]
                 masks = masks.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
-                with amp.autocast(enabled=CONFIG['mixed_precision'] and not TPU_AVAILABLE):
+                with amp.autocast(enabled=CONFIG['mixed_precision']):
                     cls_logits, seg_logits = model(views)
                     loss_cls = criterion(cls_logits, labels)
                     if CONFIG['train_task'] == 'both':
@@ -392,13 +392,9 @@ def train_model():
                 # Scale the loss and backpropagate
                 scaler.scale(loss).backward()
                 if (i+1) % CONFIG['accum_steps'] == 0:
-                    if TPU_AVAILABLE:
-                        xm.optimizer_step(optimizer, barrier=True)
-                        xm.mark_step()
-                    else:
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
                     # Log gradient histograms for sanity checks
                     for name, param in model.named_parameters():
                         if param.grad is not None:
