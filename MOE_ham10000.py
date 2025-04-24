@@ -183,15 +183,22 @@ val_test_augmentations = transforms.Compose([
 # =====================
 # Hybrid Sampling Strategy
 # =====================
-from torch.utils.data import WeightedRandomSampler
+from torch.utils.data import WeightedRandomSampler, Subset
 
 def create_balanced_sampler(dataset):
-    # Compute class distribution
-    class_counts = np.bincount(dataset.labels)
-    total_samples = len(dataset)
-    class_weights = [total_samples / (len(class_counts) * count) for count in class_counts]
-    sample_weights = [class_weights[label] for label in dataset.labels]
-    return WeightedRandomSampler(sample_weights, num_samples=total_samples, replacement=True)
+    # support both Dataset and Subset wrappers
+    if isinstance(dataset, Subset):
+        base = dataset.dataset
+        idxs = dataset.indices
+        labels = np.array(base.labels)[idxs]
+    else:
+        labels = np.array(dataset.labels)
+    # compute class weights inversely proportional to frequency
+    class_counts = np.bincount(labels)
+    total = len(labels)
+    weights_per_class = [ total/(len(class_counts)*c) for c in class_counts ]
+    sample_weights = [ weights_per_class[int(l)] for l in labels ]
+    return WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
 
 # =====================
 # Dataset Modifications
