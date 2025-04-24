@@ -204,6 +204,71 @@ class HAM10000Dataset(Dataset):
         return views, mask_t, self.labels[idx]
 
 # =====================
+# MoE Model Definitions
+# =====================
+class ExpertModel(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        # use smaller backbone
+        self.encoder = timm.create_model(
+            'efficientnet_b0', pretrained=True, features_only=True)
+        if hasattr(self.encoder, 'set_gradient_checkpointing'):
+            self.encoder.set_gradient_checkpointing(True)
+        ch = self.encoder.feature_info[-1]['num_chs']
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(ch, num_classes)
+        self.seg_head = nn.Sequential(
+            nn.Conv2d(ch, 128, 1),
+            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False),
+            nn.Conv2d(128, 64, 3, padding=1),
+            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False),
+            nn.Conv2d(64, 1, 1),  # binary segmentation
+            nn.Upsample(size=(CONFIG['image_size'], CONFIG['image_size']),
+                        mode='bilinear', align_corners=False)
+        )
+        self.stoch_depth = CONFIG['stochastic_depth']
+
+    def forward(self, x):
+        feats = self.encoder(x)[-1]
+        pooled = self.avgpool(feats).flatten(1)
+        cls_out = self.fc(pooled)
+        seg_out = self.seg_head(feats)
+        cls_out = drop_path(cls_out, self.stoch_depth, self.training)
+        return cls_out, seg_out, pooled
+
+
+class MoE(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.experts = nn.ModuleList(
+            [ExpertModel(num_classes) for _ in range(CONFIG['num_experts'])])
+        feat_dim = self.experts[0].fc.in_features * CONFIG['num_experts']
+        self.gate = nn.Sequential(
+            nn.Linear(feat_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),              # Increased dropout
+            nn.Linear(256, CONFIG['num_experts'])
+        )
+
+    def forward(self, views):
+        assert len(views) == CONFIG['num_experts'], \
+            f"Expected {CONFIG['num_experts']} views, got {len(views)}"
+        outs = [e(v) for e, v in zip(self.experts, views)]
+        cls_stack = torch.stack([o[0] for o in outs], dim=1)
+        seg_stack = torch.stack([o[1] for o in outs], dim=1)
+        feats = torch.cat([o[2] for o in outs], dim=1)
+        gate_logits = self.gate(feats)
+        weights = F.gumbel_softmax(gate_logits, tau=1, hard=True, dim=1)
+        cls_out = (cls_stack * weights.unsqueeze(-1)).sum(1)
+        seg_out = (seg_stack * weights.view(-1, CONFIG['num_experts'], 1, 1, 1)).sum(1)
+        # expert orthogonality loss
+        ew = torch.stack([F.normalize(ex.fc.weight, dim=1) for ex in self.experts])
+        ortho = sum((ew[i] * ew[j]).sum(1).mean()
+                    for i in range(len(ew)) for j in range(i+1, len(ew)))
+        self.ortho_loss = CONFIG['ortho_weight'] * ortho
+        return cls_out, seg_out
+
+# =====================
 # DataLoader helper
 # =====================
 def make_loader(dataset, shuffle=False, sampler=None):
@@ -246,7 +311,7 @@ def train_model():
     val_loader  = make_loader(val_ds)
     test_loader = make_loader(test_ds)
 
-    # instantiate model on GPU
+    # instantiate model on GPU (use correct class name MoE)
     model = MoE(num_classes=7).to(device).to(memory_format=torch.channels_last)
 
     # safe checkpoint load
