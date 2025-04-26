@@ -36,9 +36,9 @@ class Config:
     seed: int = 42
     num_classes: int = 7
     specialist_backbones: List[str] = field(default_factory=lambda: [
-        'efficientnet_b3', 'efficientnet_b4', 'efficientnet_b5'
+        'efficientnet_b3', 'efficientnet_b4', 'efficientnet_b2'
     ])
-    generalist_backbone: str = 'efficientnet_b2'
+    generalist_backbone: str = 'efficientnet_b5'
     top_k: int = 2
     lambda_bal: float = 0.01
     generalist_bias: float = 0.5
