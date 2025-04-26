@@ -1,265 +1,308 @@
 import os
 import random
-import gc
 import logging
+from dataclasses import dataclass, field
+from typing import Tuple, List
+
 import numpy as np
-import pandas as pd
 from PIL import Image
-from tqdm import tqdm
 import torch
-import timm
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, Subset
-from torchmetrics.classification import MulticlassAUROC
-from torchmetrics import JaccardIndex
-from sklearn.model_selection import StratifiedShuffleSplit
-from sklearn.metrics import (classification_report, confusion_matrix,
-                             accuracy_score, precision_score,
-                             recall_score, f1_score, balanced_accuracy_score)
-from torchvision import transforms
-from torchvision.transforms import functional as TF
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.cuda import amp
+from sklearn.metrics import classification_report, balanced_accuracy_score
+
+import timm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from torch.cuda import amp
-from torch.utils.data import WeightedRandomSampler
+from tqdm import tqdm
 
-# CONFIGURATION
-CONFIG = {
-    'batch_size': 8,
-    'orig_size': (600, 450),
-    'lr': 2e-4,
-    'epochs': 50,
-    'num_workers': 4,
-    'num_experts': 4,
-    'patience': 5,
-    'seed': 42,
-    'test_ratio': 0.2,
-    'val_ratio': 0.2
-}
+# ------------------------
+# Configuration
+# ------------------------
 
-# DEVICE
+
+@dataclass
+class Config:
+    train_dir: str = 'train_dir'
+    val_dir: str = 'val_dir'
+    batch_size: int = 16
+    orig_size: Tuple[int, int] = (600, 450)
+    lr: float = 1e-4
+    epochs: int = 40
+    num_workers: int = 4
+    patience: int = 5
+    seed: int = 42
+    num_classes: int = 7
+    specialist_backbones: List[str] = field(default_factory=lambda: [
+        'efficientnet_b3', 'efficientnet_b4', 'efficientnet_b5'
+    ])
+    generalist_backbone: str = 'efficientnet_b2'
+    top_k: int = 2
+    lambda_bal: float = 0.01
+    generalist_bias: float = 0.5
+
+
+CONFIG = Config()
+
+# Setup logging and seeds
+o
+os.makedirs('checkpoints', exist_ok=True)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+
+torch.manual_seed(CONFIG.seed)
+np.random.seed(CONFIG.seed)
+random.seed(CONFIG.seed)
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-logging.info(f'Using device: {device}')
-# AUGMENTATIONS
-train_transform = A.Compose([
-    A.PadIfNeeded(height=CONFIG['orig_size'][1],
-                  width=CONFIG['orig_size'][0], border_mode=0),
-    A.Rotate(limit=30, border_mode=0, p=0.5),
-    A.HorizontalFlip(p=0.5),
-    A.VerticalFlip(p=0.5),
-    A.RandomBrightnessContrast(p=0.5),
-    A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1,
-                       rotate_limit=0, border_mode=0, p=0.5),
-    ToTensorV2()
-])
-val_test_transform = A.Compose([
-    A.PadIfNeeded(height=CONFIG['orig_size'][1],
-                  width=CONFIG['orig_size'][0], border_mode=0),
-    ToTensorV2()
-])
 
-# DATASET
-class HAM10000Dataset(Dataset):
-    def __init__(self, csv_file, img_dir, mask_dir, transform=None):
-        self.df = pd.read_csv(csv_file)
-        self.img_dir, self.mask_dir = img_dir, mask_dir
+# ------------------------
+# Dataset
+# ------------------------
+
+
+class ClassificationDataset(Dataset):
+    def __init__(self, root_dir: str, transform=None):
+        self.root = root_dir
         self.transform = transform
-        self.classes = ["MEL", "NV", "BCC", "AKIEC", "BKL", "DF", "VASC"]
+        # discover classes
+        self.classes = sorted(os.listdir(self.root))
+        self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
+        self.samples: List[Tuple[str, int]] = []
+        for c in self.classes:
+            class_dir = os.path.join(self.root, c)
+            for fname in os.listdir(class_dir):
+                if fname.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    self.samples.append(
+                        (os.path.join(class_dir, fname), self.class_to_idx[c]))
+        self.labels = [label for _, label in self.samples]
+        logging.info(f"Loaded {len(self.samples)} samples from {self.root}")
 
     def __len__(self):
-        return len(self.df)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        try:
-            row = self.df.iloc[idx]
-            img = Image.open(os.path.join(
-                self.img_dir, row['image'] + '.jpg')).convert('RGB')
-            mask = Image.open(os.path.join(
-                self.mask_dir, row['image'] + '_segmentation.png')).convert('L')
-            img, mask = np.array(img), np.array(mask)
-            if self.transform:
-                augmented = self.transform(image=img, mask=mask)
-                img, mask = augmented['image'], augmented['mask']
-            label = int((row[self.classes].values == 1).argmax())
-            mask = (mask > 0).long()
-            return img, mask.unsqueeze(0), label
-        except Exception as e:
-            logging.error(f"Error loading sample at index {idx}: {e}")
-            return torch.zeros(3, *CONFIG['orig_size']), torch.zeros(1, *CONFIG['orig_size']), 0
+        path, label = self.samples[idx]
+        img = Image.open(path).convert('RGB')
+        img_np = np.array(img)
+        if self.transform:
+            img_t = self.transform(image=img_np)['image']
+        else:
+            img_t = ToTensorV2()(image=img_np)['image']
+        return img_t, label
 
-# BALANCED SAMPLER
-def make_balanced_sampler(dataset, indices):
-    # extract labels for the given indices
-    labels = np.array([
-        int((dataset.df.iloc[i][dataset.classes].values == 1).argmax())
-        for i in indices
-    ])
-    # compute class counts and weights
-    class_counts = np.bincount(labels, minlength=len(dataset.classes))
-    class_weights = 1.0 / class_counts
-    sample_weights = class_weights[labels]
-    return WeightedRandomSampler(sample_weights,
-                                 num_samples=len(sample_weights),
-                                 replacement=True)
 
-# MODEL DEFINITIONS
+# ------------------------
+# Transforms
+# ------------------------
+train_transform = A.Compose([
+    A.Resize(CONFIG.orig_size[1], CONFIG.orig_size[0]),
+    A.RandomResizedCrop(
+        CONFIG.orig_size[1], CONFIG.orig_size[0], scale=(0.8, 1.0)),
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.RandomBrightnessContrast(p=0.3),
+    A.Normalize(),
+    ToTensorV2()
+])
 
-class Expert(nn.Module):
-    def __init__(self, nc):
+val_transform = A.Compose([
+    A.Resize(CONFIG.orig_size[1], CONFIG.orig_size[0]),
+    A.Normalize(),
+    ToTensorV2()
+])
+
+# ------------------------
+# Expert with Self-Attn
+# ------------------------
+
+
+class BaseExpert(nn.Module):
+    def __init__(self, backbone_name: str):
         super().__init__()
+        # CNN feature extractor
         self.backbone = timm.create_model(
-            'efficientnet_b4', pretrained=True, num_classes=0)
-        self.head_cls = nn.Linear(self.backbone.num_features, nc)
-        self.head_seg = nn.Sequential(
-            nn.Conv2d(self.backbone.num_features, 64, 3, padding=1),
-            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False),
-            nn.Conv2d(64, 1, 1)
+            backbone_name,
+            pretrained=True,
+            features_only=True
         )
+        feat_info = self.backbone.feature_info.info[-1]
+        self.channels = feat_info['num_chs']
+        # small Transformer encoder for self-attention
+        self.trans_enc = nn.TransformerEncoderLayer(
+            d_model=self.channels,
+            nhead=8,
+            dim_feedforward=4*self.channels,
+            dropout=0.1,
+            batch_first=True
+        )
+        # final classifier
+        self.classifier = nn.Linear(self.channels, CONFIG.num_classes)
 
     def forward(self, x):
-        feat = self.backbone(x)
-        cls = self.head_cls(feat)
-        seg = self.head_seg(feat.unsqueeze(-1).unsqueeze(-1))
-        return cls, seg
+        # extract spatial features
+        feat_map = self.backbone(x)[-1]          # (B, C, H, W)
+        B, C, H, W = feat_map.shape
+        tokens = feat_map.flatten(2).permute(0, 2, 1)  # (B, H*W, C)
+        attn_out = self.trans_enc(tokens)           # (B, H*W, C)
+        pooled = attn_out.mean(dim=1)               # (B, C)
+        logits = self.classifier(pooled)            # (B, num_classes)
+        return pooled, logits
+
+# ------------------------
+# Mixture-of-Experts with Generalist
+# ------------------------
 
 
 class MoE(nn.Module):
-    def __init__(self, nc):
+    def __init__(self):
         super().__init__()
-        self.experts = nn.ModuleList([Expert(nc)
-                                     for _ in range(CONFIG['num_experts'])])
-        self.gate = nn.Sequential(nn.Linear(nc * CONFIG['num_experts'], 128),
-                                  nn.ReLU(), nn.Linear(128, CONFIG['num_experts']))
+        # create specialist experts
+        self.spec_experts = nn.ModuleList([
+            BaseExpert(bk) for bk in CONFIG.specialist_backbones
+        ])
+        # create a generalist expert
+        self.generalist = BaseExpert(CONFIG.generalist_backbone)
+        # combine into single ModuleList
+        self.experts = nn.ModuleList(
+            list(self.spec_experts) + [self.generalist])
+        self.num_specs = len(self.spec_experts)
+        self.num_experts = len(self.experts)
+        # gating network takes concatenated pooled features
+        total_dim = self.num_experts * self.spec_experts[0].channels
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(total_dim, total_dim//2),
+            nn.ReLU(inplace=True),
+            nn.Linear(total_dim//2, self.num_experts)
+        )
 
-    def forward(self, x):
-        outs = [e(x) for e in self.experts]
-        cls_stack = torch.stack([o[0] for o in outs], dim=1)
-        seg_stack = torch.stack([o[1] for o in outs], dim=1)
-        feats = torch.cat([o[0] for o in outs], dim=1)
-        w = F.gumbel_softmax(self.gate(feats), hard=True, dim=1)
-        cls = (cls_stack * w.unsqueeze(-1)).sum(1)
-        seg = (seg_stack * w.view(-1, CONFIG['num_experts'], 1, 1, 1)).sum(1)
-        return cls, seg
+    def forward(self, x, epoch=None):
+        # gather features and logits from all experts
+        feats, logits = [], []
+        for expert in self.experts:
+            f, l = expert(x)
+            feats.append(f)
+            logits.append(l)
+        # concatenate for gating
+        feat_tensor = torch.cat(feats, dim=1)    # (B, E*C)
+        scores = self.gate_mlp(feat_tensor)       # (B, E)
+        # bias generalist to ensure minimum floor
+        scores[:, -1] += CONFIG.generalist_bias
+        # top-k selection
+        topk_vals, topk_idx = scores.topk(CONFIG.top_k, dim=1)
+        mask = torch.zeros_like(scores).scatter(1, topk_idx, 1)
+        # annealed Gumbel softmax
+        temp = max(1.0 - 0.045*(epoch or 0), 0.1)
+        gate_weights = torch.zeros_like(scores)
+        soft = F.softmax(topk_vals / temp, dim=1)
+        gate_weights.scatter_(1, topk_idx, soft)
+        # load-balance penalty on specialists only
+        avg_gate_spec = gate_weights[:, :self.num_specs].mean(dim=0)
+        load_loss = CONFIG.lambda_bal * \
+            ((avg_gate_spec - 1.0/self.num_specs)**2).sum()
+        # combine logits
+        logits_stack = torch.stack(logits, dim=1)   # (B, E, C)
+        gw = gate_weights.unsqueeze(-1)            # (B, E, 1)
+        cls_out = (gw * logits_stack).sum(dim=1)   # (B, C)
+        return cls_out, load_loss
 
-# TRAIN / EVAL
+# ------------------------
+# Sampler
+# ------------------------
 
 
-def train_one_epoch(model, loader, opt, scaler):
+def make_balanced_sampler(dataset: ClassificationDataset) -> WeightedRandomSampler:
+    counts = np.bincount(dataset.labels, minlength=CONFIG.num_classes)
+    weights = 1.0 / counts
+    sample_w = [weights[l] for l in dataset.labels]
+    return WeightedRandomSampler(sample_w, len(sample_w), replacement=True)
+
+# ------------------------
+# Training & Evaluation
+# ------------------------
+
+
+def train_epoch(model, loader, optimizer, scaler, epoch):
     model.train()
-    tot_loss = 0
-    for imgs, masks, labels in loader:
-        imgs, masks, labels = imgs.to(
-            device), masks.to(device), labels.to(device)
+    total_loss = 0.0
+    for imgs, labels in tqdm(loader, desc=f"Train E{epoch}"):
+        imgs, labels = imgs.to(device), labels.to(device)
         with amp.autocast():
-            cls, seg = model(imgs)
-            loss = F.cross_entropy(
-                cls, labels) + F.binary_cross_entropy_with_logits(seg, masks.float())
-        opt.zero_grad()
+            cls_logits, load_loss = model(imgs, epoch)
+            cls_loss = F.cross_entropy(cls_logits, labels)
+            loss = cls_loss + load_loss
+        optimizer.zero_grad()
         scaler.scale(loss).backward()
-        scaler.step(opt)
+        scaler.step(optimizer)
         scaler.update()
-        tot_loss += loss.item()
-    return tot_loss / len(loader)
+        total_loss += loss.item()
+    avg = total_loss / len(loader)
+    logging.info(f"Epoch {epoch} Train Loss: {avg:.4f}")
+    return avg
 
 
-def evaluate(model, loader, split_name="Validation"):
+def evaluate(model, loader, split="Val"):
     model.eval()
-    all_pred, all_true = [], []
+    all_preds, all_labels = [], []
     with torch.no_grad():
-        for imgs, _, labels in loader:
+        for imgs, labels in tqdm(loader, desc=split):
             imgs = imgs.to(device)
-            cls, _ = model(imgs)
-            pred = cls.argmax(1).cpu().numpy()
-            all_pred.extend(pred)
-            all_true.extend(labels.numpy())
-
-    print(f"\n{split_name} Set Evaluation:")
-    print(classification_report(all_true, all_pred, digits=4))
-    print("Confusion Matrix:\n", confusion_matrix(all_true, all_pred))
-    print("Balanced Accuracy:", balanced_accuracy_score(all_true, all_pred))
-    print("Precision:", precision_score(all_true, all_pred, average='macro'))
-    print("Recall:", recall_score(all_true, all_pred, average='macro'))
-    print("F1 Score:", f1_score(all_true, all_pred, average='macro'))
-    print("Overall Accuracy:", accuracy_score(all_true, all_pred))
-
-# Stacked ensemble evaluation (classification only)
-def ensemble_evaluate(model_cfgs, loader):
-    device = get_device()
-    models = []
-    for cls, ckpt in model_cfgs:
-        m = cls(nc=7).to(device)
-        m.load_state_dict(torch.load(ckpt, map_location=device))
-        m.eval()
-        models.append(m)
-    all_true, all_pred = [], []
-    with torch.no_grad():
-        for imgs, _, labels in loader:
-            imgs = imgs.to(device)
-            # sum softmax probabilities
-            probs = sum(F.softmax(m(imgs)[0], dim=1) for m in models)
-            preds = (probs / len(models)).argmax(1).cpu().numpy()
-            all_true.extend(labels.numpy())
-            all_pred.extend(preds)
-    print("\nStacked Ensemble Results:")
-    print(classification_report(all_true, all_pred, digits=4))
-    print("Balanced Acc:", balanced_accuracy_score(all_true, all_pred))
-
-def main():
-    try:
-        random.seed(CONFIG['seed'])
-        np.random.seed(CONFIG['seed'])
-        torch.manual_seed(CONFIG['seed'])
-
-        ds = HAM10000Dataset("GroundTruth.csv", "images", "masks", None)
-        labels = np.array(ds.df[ds.classes].values.argmax(1))
-
-        sss = StratifiedShuffleSplit(
-            1, test_size=CONFIG['test_ratio'], random_state=CONFIG['seed'])
-        trv, te = next(sss.split(np.arange(len(ds)), labels))
-
-        sss = StratifiedShuffleSplit(
-            1, test_size=CONFIG['val_ratio'] / (1 - CONFIG['test_ratio']), random_state=CONFIG['seed'])
-        tr, va = next(sss.split(trv, labels[trv]))
-
-        train_set = Subset(HAM10000Dataset(
-            "GroundTruth.csv", "images", "masks", train_transform), trv[tr])
-        val_set = Subset(HAM10000Dataset("GroundTruth.csv",
-                         "images", "masks", val_test_transform), trv[va])
-        test_set = Subset(HAM10000Dataset("GroundTruth.csv",
-                          "images", "masks", val_test_transform), te)
-
-        train_loader = DataLoader(
-            train_set, CONFIG['batch_size'], shuffle=True, num_workers=CONFIG['num_workers'])
-        val_loader = DataLoader(
-            val_set, CONFIG['batch_size'], shuffle=False, num_workers=CONFIG['num_workers'])
-        test_loader = DataLoader(
-            test_set, CONFIG['batch_size'], shuffle=False, num_workers=CONFIG['num_workers'])
-
-        model = MoE(nc=7).to(device)
-        opt = torch.optim.AdamW(model.parameters(), lr=CONFIG['lr'])
-        scaler = amp.GradScaler(enabled=True)
-        writer = SummaryWriter()
-
-        for e in range(CONFIG['epochs']):
-            loss = train_one_epoch(model, train_loader, opt, scaler)
-            print(f"Epoch {e + 1}/{CONFIG['epochs']} Loss: {loss:.4f}")
-            evaluate(model, val_loader, split_name="Validation")
-
-        print("Final Test Results:")
-        evaluate(model, test_loader, split_name="Test")
-
-        # deploy ensemble of three experts
-        ensemble_evaluate([
-            (Expert, "checkpoints/effb4_best.pth"),
-            (Expert, "checkpoints/effb5_best.pth"),
-            (Expert, "checkpoints/swin_small_best.pth"),
-        ], test_loader)
-
-    except Exception as e:
-        logging.error(f"Error in main execution: {e}")
+            logits, _ = model(imgs)
+            preds = logits.argmax(dim=1).cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labels.numpy())
+    logging.info(f"{split} Report:\n" +
+                 classification_report(all_labels, all_preds))
+    bal = balanced_accuracy_score(all_labels, all_preds)
+    logging.info(f"{split} Balanced Acc: {bal:.4f}")
+    return bal
 
 
+# ------------------------
+# Main
+# ------------------------
 if __name__ == '__main__':
-    main()
+    # Datasets & loaders
+    train_ds = ClassificationDataset(
+        CONFIG.train_dir, transform=train_transform)
+    val_ds = ClassificationDataset(CONFIG.val_dir,   transform=val_transform)
+    train_loader = DataLoader(
+        train_ds, batch_size=CONFIG.batch_size,
+        sampler=make_balanced_sampler(train_ds),
+        num_workers=CONFIG.num_workers, pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=CONFIG.batch_size,
+        shuffle=False, num_workers=CONFIG.num_workers, pin_memory=True
+    )
+
+    # Model, optimizer, scheduler, scaler
+    model = MoE().to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=CONFIG.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', patience=CONFIG.patience//2, factor=0.5
+    )
+    scaler = amp.GradScaler()
+
+    best_score, patience = 0.0, 0
+    for ep in range(1, CONFIG.epochs+1):
+        train_epoch(model, train_loader, optimizer, scaler, ep)
+        val_acc = evaluate(model, val_loader, split="Val")
+        scheduler.step(val_acc)
+        if val_acc > best_score:
+            best_score, patience = val_acc, 0
+            torch.save(model.state_dict(), os.path.join(
+                'checkpoints', 'best.pth'))
+            logging.info("Saved best model")
+        else:
+            patience += 1
+            if patience >= CONFIG.patience:
+                logging.info("Early stopping")
+                break
+
+    # Final evaluation on validation
+    logging.info("Final Evaluation")
+    evaluate(model, val_loader, split="Test")
